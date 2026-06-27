@@ -4,14 +4,27 @@
     "port": 46400,
     "version": "1.21.11"
   },
-
   "bot": {
     "username": "Aternos_AFK",
     "auth": "offline"
   },
-
   "antiAfk": {
     "enabled": true,
     "delay": 30000
+  },
+  "startup": {
+    "delay": 60000
+  },
+  "timeouts": {
+    "spawn": 120000
+  },
+  "reconnect": {
+    "baseDelay": 20000,
+    "maxDelay": 300000,
+    "factor": 1.8,
+    "jitter": 0.25,
+    "tripAfter": 5,
+    "tripCooldown": 600000,
+    "hardResetAfter": 20
   }
 }
