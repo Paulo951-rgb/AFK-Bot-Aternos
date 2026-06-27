@@ -2,7 +2,7 @@
   "server": {
     "ip": "SMP2baltrou.aternos.me",
     "port": 46400,
-    "version": "1.21.11"
+    "version": "1.21.1"
   },
   "bot": {
     "username": "Aternos_AFK",
