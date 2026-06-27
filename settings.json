@@ -2,26 +2,16 @@
   "server": {
     "ip": "SMP2baltrou.aternos.me",
     "port": 46400,
-    "version": "1.21.11"
+    "version": "1.21.1"
   },
 
   "bot": {
-    "username": "NomDuBot",
+    "username": "Aternos_AFK",
     "auth": "offline"
   },
 
   "antiAfk": {
     "enabled": true,
     "delay": 30000
-  },
-
-  "reconnect": {
-    "enabled": true,
-    "delay": 20000
-  },
-
-  "autoLogin": {
-    "enabled": false,
-    "password": ""
   }
 }
