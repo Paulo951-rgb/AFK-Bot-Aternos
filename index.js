@@ -187,6 +187,14 @@ function createBot() {
       checkTimeoutInterval: 120000
     });
 
+    bot.on('login', () => {
+  console.log('[Bot] LOGIN EVENT');
+});
+
+bot.on('inject_allowed', () => {
+  console.log('[Bot] INJECTION OK');
+});
+
     // ==================================================
     // LOGIN EVENT
     // ==================================================
