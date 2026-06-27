@@ -1,16 +1,17 @@
 {
   "name": "minecraft-afk-bot",
   "version": "2.0.0",
-  "description": "AFK bot — keeps an Aternos server alive 24/7",
+  "description": "Stable AFK bot for Aternos on Render using Mineflayer",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "check": "node --check index.js"
   },
   "engines": {
     "node": ">=18.0.0"
   },
   "dependencies": {
     "express": "^4.19.2",
-    "mineflayer": "^4.28.0"
+    "mineflayer": "^4.26.0"
   }
 }
