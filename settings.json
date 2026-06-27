@@ -1,41 +1,27 @@
 {
-  "name": "AFK Bot",
-  "bot-account": {
-    "username": "PerzaanLive",
-    "password": "",
-    "type": "offline"
-  },
   "server": {
     "ip": "SMP2baltrou.aternos.me",
     "port": 46400,
-    "version": "1.21.1"
+    "version": "1.21.11"
   },
-  "position": {
+
+  "bot": {
+    "username": "NomDuBot",
+    "auth": "offline"
+  },
+
+  "antiAfk": {
+    "enabled": true,
+    "delay": 30000
+  },
+
+  "reconnect": {
+    "enabled": true,
+    "delay": 20000
+  },
+
+  "autoLogin": {
     "enabled": false,
-    "x": 0,
-    "y": 64,
-    "z": 0
-  },
-  "utils": {
-    "auto-auth": {
-      "enabled": true,
-      "password": "Perzuu"
-    },
-    "anti-afk": {
-      "enabled": true
-    },
-    "chat-messages": {
-      "enabled": true,
-      "repeat": true,
-      "repeat-delay": 300,
-      "messages": [
-        "I'm a regular player",
-        "I like to play Minecraft!"
-      ]
-    },
-    "chat-log": true,
-    "auto-reconnect": true,
-    "auto-reconnect-delay": 15000,
-    "max-reconnect-delay": 120000
+    "password": ""
   }
 }
