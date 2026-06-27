@@ -214,14 +214,12 @@ bot.on('inject_allowed', () => {
 
     const spawnTimeout = setTimeout(() => {
 
-      if (!botConnected) {
+  if (!botConnected) {
+    console.log('[Bot] Spawn timeout');
+    scheduleReconnect('spawn-timeout');
+  }
 
-        console.log('[Bot] Spawn timeout');
-
-        scheduleReconnect('spawn-timeout');
-      }
-
-    }, 90000);
+}, 180000);
 
     // ==================================================
     // SPAWN
