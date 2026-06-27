@@ -154,6 +154,17 @@ function scheduleReconnect(reason = 'unknown') {
 
 function createBot() {
 
+  bot.on('error', (err) => {
+  console.log(`[Bot] Error: ${err.code || err.message}`);
+
+  if (err.code === 'ETIMEDOUT' || err.code === 'ECONNRESET') {
+    console.log('[Bot] Network failure → forcing reconnect');
+
+    botConnected = false;
+    scheduleReconnect('connect-failed');
+  }
+});
+  
   if (bot) {
     console.log('[Bot] Bot already exists');
     return;
