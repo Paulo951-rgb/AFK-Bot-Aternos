@@ -139,13 +139,18 @@ function scheduleReconnect(reason = 'unknown') {
     clearTimeout(reconnectTimeout);
   }
 
+  let delay = config.reconnect.delay;
+
+  if (reason === 'end' || reason === 'kicked' || reason === 'spawn-timeout') {
+    delay = 3000;
+  }
+
   reconnectTimeout = setTimeout(() => {
 
     reconnecting = false;
-
     createBot();
 
-  }, config.reconnect.delay);
+  }, delay);
 }
 
 // ======================================================
