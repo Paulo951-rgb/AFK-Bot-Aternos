@@ -1,5 +1,6 @@
 const mineflayer = require('mineflayer');
 const express = require('express');
+
 const config = require('./settings.json');
 
 // ======================================================
@@ -19,6 +20,7 @@ process.on('unhandledRejection', (reason) => {
 // ======================================================
 
 const app = express();
+
 const PORT = process.env.PORT || 10000;
 
 app.get('/', (_, res) => {
@@ -40,28 +42,33 @@ app.listen(PORT, () => {
 // ======================================================
 
 let bot = null;
+
+let reconnectTimeout = null;
+
 let antiAfkInterval = null;
 
 let reconnecting = false;
-let botConnected = false;
 
-let reconnectTimeout = null;
+let botConnected = false;
 
 // ======================================================
 // CLEANUP
 // ======================================================
 
 function cleanupBot() {
+
   if (antiAfkInterval) {
     clearInterval(antiAfkInterval);
     antiAfkInterval = null;
   }
 
   if (bot) {
+
     try {
       bot.removeAllListeners();
       bot.quit();
     } catch (e) {}
+
     bot = null;
   }
 
@@ -73,33 +80,48 @@ function cleanupBot() {
 // ======================================================
 
 function startAntiAfk() {
+
   if (!config.antiAfk.enabled) return;
 
-  if (antiAfkInterval) clearInterval(antiAfkInterval);
+  if (antiAfkInterval) {
+    clearInterval(antiAfkInterval);
+  }
 
   console.log('[Bot] Anti AFK started');
 
   antiAfkInterval = setInterval(() => {
+
     if (!bot || !bot.entity) return;
 
-    const actions = ['jump', 'forward', 'left', 'right'];
-    const action = actions[Math.floor(Math.random() * actions.length)];
+    const actions = [
+      'jump',
+      'forward',
+      'left',
+      'right'
+    ];
+
+    const action =
+      actions[Math.floor(Math.random() * actions.length)];
 
     bot.setControlState(action, true);
 
     setTimeout(() => {
+
       if (!bot) return;
+
       bot.setControlState(action, false);
+
     }, 1000);
 
   }, config.antiAfk.delay);
 }
 
 // ======================================================
-// RECONNECT (VERSION STABLE ATERNOS)
+// RECONNECT
 // ======================================================
 
-function handleReconnect(reason = 'unknown') {
+function scheduleReconnect(reason = 'unknown') {
+
   if (!config.reconnect.enabled) return;
 
   if (reconnecting) {
@@ -113,19 +135,17 @@ function handleReconnect(reason = 'unknown') {
 
   cleanupBot();
 
-  if (reconnectTimeout) clearTimeout(reconnectTimeout);
-
-  // 🔥 logique stable Aternos
-  let delay = 15000;
-
-  if (reason === 'end' || reason === 'kicked' || reason === 'spawn-timeout') {
-    delay = 5000; // plus rapide sur crash réel
+  if (reconnectTimeout) {
+    clearTimeout(reconnectTimeout);
   }
 
   reconnectTimeout = setTimeout(() => {
+
     reconnecting = false;
+
     createBot();
-  }, delay);
+
+  }, config.reconnect.delay);
 }
 
 // ======================================================
@@ -134,38 +154,53 @@ function handleReconnect(reason = 'unknown') {
 
 function createBot() {
 
-  if (bot && !bot._client?.socket?.destroyed) {
+  if (bot) {
     console.log('[Bot] Bot already exists');
     return;
   }
 
   console.log('====================================');
   console.log('[Bot] Creating bot...');
-  console.log(`[Bot] Connecting to ${config.server.ip}:${config.server.port}`);
+  console.log(
+    `[Bot] Connecting to ${config.server.ip}:${config.server.port}`
+  );
   console.log('====================================');
 
   try {
+
     bot = mineflayer.createBot({
+
       host: config.server.ip,
+
       port: config.server.port,
+
       username: config.bot.username,
+
       auth: config.bot.auth,
+
       version: config.server.version,
+
       hideErrors: false,
+
       connectTimeout: 60000,
+
       checkTimeoutInterval: 120000
     });
 
+    bot.on('login', () => {
+  console.log('[Bot] LOGIN EVENT');
+});
+
+bot.on('inject_allowed', () => {
+  console.log('[Bot] INJECTION OK');
+});
+
     // ==================================================
-    // LOGS
+    // LOGIN EVENT
     // ==================================================
 
     bot.on('login', () => {
-      console.log('[Bot] LOGIN EVENT');
-    });
-
-    bot.on('inject_allowed', () => {
-      console.log('[Bot] INJECTION OK');
+      console.log('[Bot] Login successful');
     });
 
     // ==================================================
@@ -173,60 +208,97 @@ function createBot() {
     // ==================================================
 
     const spawnTimeout = setTimeout(() => {
+
       if (!botConnected) {
+
         console.log('[Bot] Spawn timeout');
-        handleReconnect('spawn-timeout');
+
+        scheduleReconnect('spawn-timeout');
       }
-    }, 180000);
+
+    }, 90000);
 
     // ==================================================
-    // SPAWN OK
+    // SPAWN
     // ==================================================
 
     bot.once('spawn', () => {
+
       clearTimeout(spawnTimeout);
 
       botConnected = true;
+
       reconnecting = false;
 
       console.log('[Bot] Successfully connected');
 
       startAntiAfk();
 
+      // ==============================================
       // AUTO LOGIN
-      if (config.autoLogin.enabled && config.autoLogin.password) {
+      // ==============================================
+
+      if (
+        config.autoLogin.enabled &&
+        config.autoLogin.password
+      ) {
+
         setTimeout(() => {
+
           if (!bot) return;
 
           bot.chat(`/login ${config.autoLogin.password}`);
+
           console.log('[Auth] Login command sent');
+
         }, 3000);
       }
     });
 
     // ==================================================
-    // DISCONNECT
+    // END
     // ==================================================
 
     bot.on('end', () => {
+
       console.log('[Bot] Connection ended');
+
       botConnected = false;
-      handleReconnect('end');
+
+      scheduleReconnect('end');
     });
+
+    // ==================================================
+    // KICKED
+    // ==================================================
 
     bot.on('kicked', (reason) => {
+
       console.log('[Bot] Kicked:', reason);
+
       botConnected = false;
-      handleReconnect('kicked');
+
+      scheduleReconnect('kicked');
     });
 
+    // ==================================================
+    // ERROR
+    // ==================================================
+
     bot.on('error', (err) => {
-      console.log(`[Bot] Error: ${err.code || err.message}`);
+
+      console.log(
+        `[Bot] Error: ${err.code || err.message}`
+      );
     });
 
   } catch (err) {
-    console.log(`[Bot] Failed to create bot: ${err.message}`);
-    handleReconnect('create-failed');
+
+    console.log(
+      `[Bot] Failed to create bot: ${err.message}`
+    );
+
+    scheduleReconnect('create-failed');
   }
 }
 
@@ -238,7 +310,12 @@ console.log('====================================');
 console.log(' Minecraft AFK Bot Stable Edition');
 console.log('====================================');
 
-console.log('[Bot] Waiting 60 seconds before startup...');
+console.log(
+  '[Bot] Waiting 60 seconds before startup...'
+);
+
+// IMPORTANT POUR ATERNOS
+// laisse le serveur finir de démarrer
 
 setTimeout(() => {
   createBot();
