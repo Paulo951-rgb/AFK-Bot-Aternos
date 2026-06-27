@@ -154,10 +154,10 @@ function scheduleReconnect(reason = 'unknown') {
 
 function createBot() {
 
-  if (bot) {
-    console.log('[Bot] Bot already exists');
-    return;
-  }
+  if (bot && !bot._client?.socket?.destroyed) {
+  console.log('[Bot] Bot already exists');
+  return;
+}
 
   console.log('====================================');
   console.log('[Bot] Creating bot...');
