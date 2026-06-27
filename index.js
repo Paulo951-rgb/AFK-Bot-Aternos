@@ -33,9 +33,9 @@ app.get('/', (_, res) => {
 
 app.get('/health', (_, res) => {
   res.json({
-    status:    botState.connected ? 'online' : 'offline',
-    attempts:  botState.attempts,
-    uptime:    Math.floor((Date.now() - botState.startTime) / 1000),
+    status:   botState.connected ? 'online' : 'offline',
+    attempts: botState.attempts,
+    uptime:   Math.floor((Date.now() - botState.startTime) / 1000),
   });
 });
 
@@ -49,7 +49,7 @@ app.listen(PORT, () => {
 // SELF-PING — évite que Render endorme le service gratuit
 // ============================================================
 function startSelfPing() {
-  const INTERVAL = 10 * 60 * 1000; // toutes les 10 min
+  const INTERVAL = 10 * 60 * 1000;
   setInterval(() => {
     const url      = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
     const protocol = url.startsWith('https') ? https : http;
@@ -66,7 +66,6 @@ let reconnecting   = false;
 let reconnectTimer = null;
 let afkInterval    = null;
 let chatInterval   = null;
-let attempts       = 0;
 
 const botState = {
   connected: false,
@@ -100,7 +99,6 @@ function scheduleReconnect(reason) {
 
   cleanup();
 
-  // Délai qui augmente progressivement (max 2 min)
   const baseDelay = config.utils['auto-reconnect-delay'] || 15000;
   const maxDelay  = config.utils['max-reconnect-delay']  || 120000;
   const delay     = Math.min(baseDelay + botState.attempts * 5000, maxDelay);
@@ -132,12 +130,11 @@ function startAntiAfk() {
       if (bot) bot.setControlState(action, false);
     }, 800 + Math.random() * 400);
 
-    // Look around aléatoirement
     const yaw   = (Math.random() - 0.5) * Math.PI * 2;
     const pitch = (Math.random() - 0.5) * Math.PI * 0.5;
     bot.look(yaw, pitch, false);
 
-  }, 25000 + Math.random() * 10000); // entre 25s et 35s
+  }, 15000 + Math.random() * 5000);
 
   console.log('[Bot] Anti-AFK started');
 }
@@ -154,7 +151,7 @@ function startChatMessages() {
   if (messages.length === 0) return;
 
   let i = 0;
-  const delay = (cfg['repeat-delay'] || 120) * 1000;
+  const delay = (cfg['repeat-delay'] || 300) * 1000;
 
   chatInterval = setInterval(() => {
     if (!bot || !botState.connected) return;
@@ -198,15 +195,14 @@ function createBot() {
 
   try {
     bot = mineflayer.createBot({
-      host:    config.server.ip,
-      port:    config.server.port,
+      host:     config.server.ip,
+      port:     config.server.port,
       username: config['bot-account'].username,
-      auth:    config['bot-account'].type || 'offline',
-      version: config.server.version,
+      auth:     config['bot-account'].type || 'offline',
+      version:  config.server.version,
 
-      // Timeouts longs pour Aternos qui est lent à démarrer
-      connectTimeout:        90000,   // 90s pour établir TCP
-      checkTimeoutInterval:  600000,  // 10 min avant de couper si pas de paquet
+      connectTimeout:       90000,  // 90s pour établir la connexion TCP
+      checkTimeoutInterval: 30000,  // 30s — répond aux keepalive du serveur
       hideErrors: false,
     });
 
@@ -216,9 +212,7 @@ function createBot() {
     return;
   }
 
-  // ----------------------------------------------------------
   // Timeout de spawn : si pas de spawn en 3 min → reconnect
-  // ----------------------------------------------------------
   const spawnTimeout = setTimeout(() => {
     if (!botState.connected) {
       console.log('[Bot] Spawn timeout (3min) — reconnecting');
@@ -226,9 +220,7 @@ function createBot() {
     }
   }, 180000);
 
-  // ----------------------------------------------------------
-  // SPAWN ✅
-  // ----------------------------------------------------------
+  // SPAWN
   bot.once('spawn', () => {
     clearTimeout(spawnTimeout);
     botState.connected = true;
@@ -242,9 +234,7 @@ function createBot() {
     startChatMessages();
   });
 
-  // ----------------------------------------------------------
   // DÉCONNEXION
-  // ----------------------------------------------------------
   bot.on('end', (reason) => {
     console.log(`[Bot] Disconnected — ${reason || 'no reason'}`);
     clearTimeout(spawnTimeout);
@@ -253,9 +243,7 @@ function createBot() {
     }
   });
 
-  // ----------------------------------------------------------
   // KICK
-  // ----------------------------------------------------------
   bot.on('kicked', (reason) => {
     let msg = reason;
     try { msg = JSON.stringify(JSON.parse(reason)); } catch (_) {}
@@ -264,18 +252,12 @@ function createBot() {
     scheduleReconnect('kicked');
   });
 
-  // ----------------------------------------------------------
   // ERREUR réseau
-  // ----------------------------------------------------------
   bot.on('error', (err) => {
-    // On log sans planter
     console.log(`[Bot] Network error: ${err.code || err.message}`);
-    // Pas de reconnect ici — le event "end" va suivre automatiquement
   });
 
-  // ----------------------------------------------------------
   // CHAT log
-  // ----------------------------------------------------------
   if (config.utils && config.utils['chat-log']) {
     bot.on('chat', (username, message) => {
       if (username === bot.username) return;
@@ -285,7 +267,7 @@ function createBot() {
 }
 
 // ============================================================
-// DÉMARRAGE — attendre 30s pour laisser Aternos charger
+// DÉMARRAGE
 // ============================================================
 console.log('==========================================');
 console.log(' Minecraft AFK Bot — Stable Edition');
