@@ -12,7 +12,7 @@
 
   "antiAfk": {
     "enabled": true,
-    "delay": 30000
+    "delay": 3000
   },
 
   "reconnect": {
