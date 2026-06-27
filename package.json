@@ -12,6 +12,6 @@
   },
   "dependencies": {
     "express": "^4.19.2",
-    "mineflayer": "^4.26.0"
+    "mineflayer": "latest"
   }
 }
