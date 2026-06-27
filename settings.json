@@ -2,7 +2,7 @@
   "server": {
     "ip": "SMP2baltrou.aternos.me",
     "port": 46400,
-    "version": "1.21.11"
+    "version": "false"
   },
 
   "bot": {
