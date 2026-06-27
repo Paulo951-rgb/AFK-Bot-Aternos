@@ -1,0 +1,17 @@
+{
+  "name": "minecraft-afk-bot",
+  "version": "3.0.0",
+  "description": "AFK bot for Aternos Minecraft servers — hosted on Render",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.18.1",
+    "mineflayer": "^4.34.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
