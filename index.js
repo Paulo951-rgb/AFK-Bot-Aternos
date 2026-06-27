@@ -1,357 +1,408 @@
+/**
+ * index.js — Minecraft AFK Bot  v2.0
+ *
+ * Architecture : State Machine  +  Exponential Backoff  +  Circuit Breaker
+ * Target       : Aternos (PaperMC 1.21.1) on Render Free
+ *
+ * State diagram:
+ *
+ *   IDLE ──────► CONNECTING ──────► CONNECTED
+ *     ▲                                  │
+ *     │                                  ▼
+ *   WAITING ◄──────────────────── (disconnect / error)
+ */
+
 'use strict';
 
-const fs = require('fs');
-const path = require('path');
-const express = require('express');
 const mineflayer = require('mineflayer');
+const express    = require('express');
+const fs         = require('fs');
+const path       = require('path');
 
-const State = Object.freeze({
-  IDLE: 'IDLE',
-  CONNECTING: 'CONNECTING',
-  CONNECTED: 'CONNECTED',
-  WAITING: 'WAITING',
-  STOPPING: 'STOPPING',
-});
+// ══════════════════════════════════════════════════════════════
+// §1 — CONFIGURATION
+// ══════════════════════════════════════════════════════════════
 
-const DEFAULTS = Object.freeze({
-  antiAfkDelay: 30000,
-  startupDelay: 60000,
-  spawnTimeout: 120000,
-  reconnect: {
-    baseDelay: 20000,
-    maxDelay: 300000,
-    factor: 1.8,
-    jitter: 0.25,
-    tripAfter: 5,
-    tripCooldown: 600000,
-    hardResetAfter: 20,
-  },
-});
-
-function now() {
-  return new Date().toISOString();
-}
-
-const log = {
-  info: (...args) => console.log(now(), '[INFO ]', ...args),
-  warn: (...args) => console.warn(now(), '[WARN ]', ...args),
-  error: (...args) => console.error(now(), '[ERROR]', ...args),
-  state: (...args) => console.log(now(), '[STATE]', ...args),
-  bot: (...args) => console.log(now(), '[BOT  ]', ...args),
-  net: (...args) => console.log(now(), '[NET  ]', ...args),
-};
-
-function readSettings() {
-  const file = path.join(__dirname, 'settings.json');
-  const settings = JSON.parse(fs.readFileSync(file, 'utf8'));
-  const host = settings.server && settings.server.ip;
-  const port = Number(settings.server && settings.server.port);
-  const version = settings.server && settings.server.version;
-  const username = settings.bot && settings.bot.username;
-  const auth = (settings.bot && settings.bot.auth) || 'offline';
-
-  if (!host) throw new Error('settings.server.ip is required');
-  if (!Number.isInteger(port) || port < 1 || port > 65535) {
-    throw new Error('settings.server.port must be a valid TCP port');
-  }
-  if (!version) throw new Error('settings.server.version is required');
-  if (!username) throw new Error('settings.bot.username is required');
-
-  return Object.freeze({
-    host,
-    port,
-    version,
-    username,
-    auth,
-    antiAfkEnabled: settings.antiAfk && settings.antiAfk.enabled !== undefined ? settings.antiAfk.enabled : true,
-    antiAfkDelay: Number((settings.antiAfk && settings.antiAfk.delay) || DEFAULTS.antiAfkDelay),
-    startupDelay: Number((settings.startup && settings.startup.delay) || DEFAULTS.startupDelay),
-    spawnTimeout: Number((settings.timeouts && settings.timeouts.spawn) || DEFAULTS.spawnTimeout),
-    reconnect: Object.freeze({
-      baseDelay: Number((settings.reconnect && settings.reconnect.baseDelay) || DEFAULTS.reconnect.baseDelay),
-      maxDelay: Number((settings.reconnect && settings.reconnect.maxDelay) || DEFAULTS.reconnect.maxDelay),
-      factor: Number((settings.reconnect && settings.reconnect.factor) || DEFAULTS.reconnect.factor),
-      jitter: Number((settings.reconnect && settings.reconnect.jitter) || DEFAULTS.reconnect.jitter),
-      tripAfter: Number((settings.reconnect && settings.reconnect.tripAfter) || DEFAULTS.reconnect.tripAfter),
-      tripCooldown: Number((settings.reconnect && settings.reconnect.tripCooldown) || DEFAULTS.reconnect.tripCooldown),
-      hardResetAfter: Number((settings.reconnect && settings.reconnect.hardResetAfter) || DEFAULTS.reconnect.hardResetAfter),
-    }),
-  });
-}
-
-let config;
+let rawSettings;
 try {
-  config = readSettings();
-} catch (error) {
-  log.error('Invalid settings.json:', error.message);
+  rawSettings = JSON.parse(
+    fs.readFileSync(path.join(__dirname, 'settings.json'), 'utf-8'),
+  );
+} catch (err) {
+  console.error('[FATAL] Cannot read settings.json:', err.message);
   process.exit(1);
 }
 
-let state = State.IDLE;
-let bot = null;
-let spawnTimer = null;
-let afkInterval = null;
-let reconnectTimer = null;
-let afkCycle = 0;
-let startedAt = Date.now();
-let lastDisconnectReason = null;
+const CFG = Object.freeze({
+  // Minecraft server
+  host:    rawSettings.server.ip,
+  port:    Number(rawSettings.server.port),
+  version: rawSettings.server.version,
 
-const circuitBreaker = {
-  attempts: 0,
-  consecutiveFailures: 0,
-  tripped: false,
+  // Bot credentials
+  username: rawSettings.bot.username,
+  auth:     rawSettings.bot.auth,
+
+  // Anti-AFK
+  antiAfkEnabled: rawSettings.antiAfk?.enabled  ?? true,
+  antiAfkDelay:   rawSettings.antiAfk?.delay    ?? 30_000,
+
+  // Reconnect / circuit-breaker tuning
+  reconnect: {
+    base:          20_000,  // 20s base delay
+    max:          300_000,  // 5 min ceiling
+    factor:           1.8,  // each attempt is ×1.8 the previous
+    jitter:          0.25,  // ±25 % random variance
+    tripAfter:          5,  // circuit trips after N consecutive failures
+    tripCooldown:  600_000, // 10 min cool-down when circuit is tripped
+    hardReset:         20,  // force counter reset after N total failures
+  },
+
+  // How long to wait for Mineflayer to receive the spawn packet
+  // Aternos + Paper can take 60–90 s to load chunks after login
+  spawnTimeout: 120_000, // 2 minutes
+
+  // How long to wait before the very first connection attempt.
+  // Aternos often shows "online" before PaperMC has fully initialised.
+  startupDelay: 60_000, // 60 seconds
+});
+
+// ══════════════════════════════════════════════════════════════
+// §2 — LOGGER
+// ══════════════════════════════════════════════════════════════
+
+function ts() { return new Date().toISOString(); }
+
+const LOG = {
+  info:  (...a) => console.log(ts(), '[INFO ]', ...a),
+  warn:  (...a) => console.log(ts(), '[WARN ]', ...a),
+  error: (...a) => console.error(ts(), '[ERROR]', ...a),
+  bot:   (...a) => console.log(ts(), '[BOT  ]', ...a),
+  net:   (...a) => console.log(ts(), '[NET  ]', ...a),
+  state: (...a) => console.log(ts(), '[STATE]', ...a),
 };
 
-function transition(nextState, reason) {
-  reason = reason || '';
-  if (state === nextState) return;
-  log.state(state + ' -> ' + nextState + (reason ? ' (' + reason + ')' : ''));
-  state = nextState;
+// ══════════════════════════════════════════════════════════════
+// §3 — STATE MACHINE
+// ══════════════════════════════════════════════════════════════
+
+const State = Object.freeze({
+  IDLE:       'IDLE',
+  CONNECTING: 'CONNECTING',
+  CONNECTED:  'CONNECTED',
+  WAITING:    'WAITING',
+});
+
+let state = State.IDLE;
+
+function transition(to, why = '') {
+  if (to === state) return;
+  LOG.state(`${state} → ${to}${why ? `  (${why})` : ''}`);
+  state = to;
 }
 
-function formatDelay(ms) {
-  if (ms >= 60000) return (ms / 60000).toFixed(1) + ' min';
-  return (ms / 1000).toFixed(1) + ' s';
-}
+// ══════════════════════════════════════════════════════════════
+// §4 — CIRCUIT BREAKER + RECONNECT SCHEDULER
+// ══════════════════════════════════════════════════════════════
 
-function computeReconnectDelay() {
-  if (circuitBreaker.tripped) return config.reconnect.tripCooldown;
-  const exponentialDelay = Math.min(
-    config.reconnect.baseDelay * Math.pow(config.reconnect.factor, circuitBreaker.attempts - 1),
-    config.reconnect.maxDelay,
+const CB = {
+  attempts:    0,
+  consecutive: 0,
+  tripped:     false,
+  timer:       null,
+};
+
+function backoffDelay() {
+  if (CB.tripped) return CFG.reconnect.tripCooldown;
+
+  const base = Math.min(
+    CFG.reconnect.base * Math.pow(CFG.reconnect.factor, CB.attempts),
+    CFG.reconnect.max,
   );
-  const jitterRange = exponentialDelay * config.reconnect.jitter;
-  const jitter = (Math.random() * 2 - 1) * jitterRange;
-  return Math.max(5000, Math.floor(exponentialDelay + jitter));
+  const jitter = base * CFG.reconnect.jitter * (Math.random() * 2 - 1);
+  return Math.max(5_000, Math.floor(base + jitter));
 }
 
-function clearLifecycleTimers() {
-  if (spawnTimer) {
-    clearTimeout(spawnTimer);
-    spawnTimer = null;
-  }
-  if (afkInterval) {
-    clearInterval(afkInterval);
-    afkInterval = null;
-  }
-}
-
-function cleanupBot() {
-  clearLifecycleTimers();
-  if (!bot) return;
-
-  const currentBot = bot;
-  bot = null;
-
-  try {
-    currentBot.removeAllListeners();
-  } catch (error) {
-    log.warn('Could not remove bot listeners:', error.message);
-  }
-
-  try {
-    if (currentBot._client) currentBot._client.removeAllListeners();
-    if (currentBot._client && currentBot._client.socket) {
-      currentBot._client.socket.removeAllListeners();
-      currentBot._client.socket.destroy();
-    }
-  } catch (error) {
-    log.warn('Could not destroy Minecraft socket:', error.message);
-  }
-
-  try {
-    currentBot.end('cleanup');
-  } catch (error) {
-    log.warn('Could not end Mineflayer bot cleanly:', error.message);
-  }
-}
-
-function resetCircuitBreaker() {
-  circuitBreaker.attempts = 0;
-  circuitBreaker.consecutiveFailures = 0;
-  circuitBreaker.tripped = false;
-  log.net('Circuit breaker reset after successful spawn');
-}
-
+/**
+ * Schedule a reconnect attempt with exponential backoff + jitter.
+ *
+ * Guard rails:
+ *  - No-op if already WAITING / CONNECTED / CONNECTING.
+ *  - Trips the circuit breaker after N consecutive failures.
+ *  - Hard-resets all counters if total attempts exceed the ceiling.
+ */
 function scheduleReconnect(reason) {
-  if (state === State.STOPPING) return;
-  if (state === State.CONNECTING || state === State.CONNECTED || state === State.WAITING) {
-    log.warn('Reconnect ignored because state is ' + state);
+  if (
+    state === State.WAITING   ||
+    state === State.CONNECTED ||
+    state === State.CONNECTING
+  ) {
+    LOG.warn(`scheduleReconnect() ignored — current state: ${state}`);
     return;
   }
 
-  if (reconnectTimer) {
-    clearTimeout(reconnectTimer);
-    reconnectTimer = null;
+  // Clear any stale timer
+  clearTimeout(CB.timer);
+  CB.timer = null;
+
+  CB.attempts++;
+  CB.consecutive++;
+
+  // Trip the circuit breaker
+  if (!CB.tripped && CB.consecutive >= CFG.reconnect.tripAfter) {
+    CB.tripped = true;
+    LOG.warn(`⚡ Circuit breaker TRIPPED after ${CB.consecutive} consecutive failures`);
   }
 
-  circuitBreaker.attempts += 1;
-  circuitBreaker.consecutiveFailures += 1;
-
-  if (!circuitBreaker.tripped && circuitBreaker.consecutiveFailures >= config.reconnect.tripAfter) {
-    circuitBreaker.tripped = true;
-    log.warn('Circuit breaker tripped after ' + circuitBreaker.consecutiveFailures + ' consecutive failures');
+  // Hard reset if we've been failing for a very long time
+  if (CB.attempts > CFG.reconnect.hardReset) {
+    LOG.warn('🔄 Hard reset — failure counters cleared');
+    CB.attempts = 0; CB.consecutive = 0; CB.tripped = false;
   }
 
-  if (circuitBreaker.attempts > config.reconnect.hardResetAfter) {
-    log.warn('Reconnect counters hard-reset after prolonged failures');
-    circuitBreaker.attempts = 1;
-    circuitBreaker.consecutiveFailures = 1;
-    circuitBreaker.tripped = false;
-  }
+  const delay = backoffDelay();
+  const label = delay >= 60_000
+    ? `${(delay / 60_000).toFixed(1)} min`
+    : `${(delay / 1_000).toFixed(1)} s`;
 
-  const delay = computeReconnectDelay();
-  lastDisconnectReason = reason;
-  log.net('Reconnect #' + circuitBreaker.attempts + ' scheduled in ' + formatDelay(delay) + '; reason=' + reason + (circuitBreaker.tripped ? '; circuit=tripped' : ''));
+  LOG.net(
+    `Reconnect #${CB.attempts} in ${label}` +
+    `  —  reason: "${reason}"` +
+    (CB.tripped ? '  [CIRCUIT TRIPPED]' : ''),
+  );
 
   transition(State.WAITING, reason);
-  reconnectTimer = setTimeout(() => {
-    reconnectTimer = null;
-    if (state !== State.WAITING) return;
-    transition(State.IDLE, 'reconnect timer fired');
-    createBot();
+
+  CB.timer = setTimeout(() => {
+    CB.timer = null;
+    // Only proceed if we are still waiting (nothing else reconnected us)
+    if (state === State.WAITING) {
+      transition(State.IDLE, 'timer fired');
+      createBot();
+    }
   }, delay);
 }
 
-function finishConnectionCycle(doneRef, reason) {
-  if (doneRef.done) return false;
-  doneRef.done = true;
-  cleanupBot();
-  if (state !== State.STOPPING) {
-    transition(State.IDLE, reason);
-    scheduleReconnect(reason);
-  }
-  return true;
+function onConnectSuccess() {
+  CB.attempts    = 0;
+  CB.consecutive = 0;
+  CB.tripped     = false;
+  LOG.net('✅ Circuit breaker RESET — connection healthy');
 }
 
-function createBot() {
-  if (state !== State.IDLE) {
-    log.warn('createBot ignored because state is ' + state);
+// ══════════════════════════════════════════════════════════════
+// §5 — BOT LIFECYCLE
+// ══════════════════════════════════════════════════════════════
+
+let bot         = null;  // Single bot reference — always null when not connected
+let spawnTimer  = null;  // Spawn-timeout handle
+let afkInterval = null;  // Anti-AFK interval handle
+let afkCycle    = 0;     // Action index for cycling through AFK moves
+
+/**
+ * Destroys ALL resources attached to the current bot instance:
+ *   timers → intervals → event listeners → TCP socket → bot.end()
+ *
+ * Always sets `bot = null` before returning.
+ * Safe to call multiple times (idempotent).
+ */
+function cleanupBot() {
+  LOG.bot('🧹 Cleaning up…');
+
+  // 1. Kill timers first so nothing can fire during cleanup
+  if (spawnTimer)  { clearTimeout(spawnTimer);   spawnTimer  = null; }
+  if (afkInterval) { clearInterval(afkInterval); afkInterval = null; }
+
+  if (!bot) {
+    LOG.bot('  Nothing to clean');
     return;
   }
-  if (bot) {
-    log.warn('Stale bot reference found before connect; cleaning up');
+
+  // 2. Grab and immediately null the reference so no other handler can use it
+  const b = bot;
+  bot = null;
+
+  // 3. Remove all Mineflayer-level listeners
+  try { b.removeAllListeners(); } catch (_) {}
+
+  // 4. Destroy the raw TCP socket (ensures OS releases the connection)
+  try {
+    if (b._client?.socket) {
+      b._client.socket.removeAllListeners();
+      b._client.socket.destroy();
+    }
+  } catch (_) {}
+
+  // 5. Remove internal minecraft-protocol client listeners
+  try { b._client?.removeAllListeners(); } catch (_) {}
+
+  // 6. Tell Mineflayer to end (no-op if already dead, but safe)
+  try { b.end('cleanup'); } catch (_) {}
+
+  LOG.bot('✅ Cleanup complete');
+}
+
+/**
+ * Creates a Mineflayer bot and wires all event handlers.
+ *
+ * This function is protected by the state machine.
+ * A `done` flag (per-invocation closure) prevents multiple event handlers
+ * from triggering cleanup/reconnect concurrently.
+ */
+function createBot() {
+  // ── Double-bot guard ──────────────────────────────────────────
+  if (state === State.CONNECTING || state === State.CONNECTED) {
+    LOG.warn(`createBot() blocked — already in state "${state}"`);
+    return;
+  }
+  if (bot !== null) {
+    LOG.warn('createBot() — stale bot reference, forcing cleanup first');
     cleanupBot();
   }
+  // ──────────────────────────────────────────────────────────────
 
-  transition(State.CONNECTING, 'createBot');
-  log.bot('Connecting to ' + config.host + ':' + config.port + ' with Minecraft ' + config.version);
+  transition(State.CONNECTING);
+  LOG.bot(`📡 Connecting → ${CFG.host}:${CFG.port}  [Minecraft ${CFG.version}]`);
 
-  const doneRef = { done: false };
+  // Per-invocation close flag.
+  // Ensures that if 'end' fires, spawn-timeout fires, or 'error' causes end to fire,
+  // only the FIRST handler actually performs cleanup and schedules a reconnect.
+  let done = false;
 
+  // ── Instantiate ──────────────────────────────────────────────
   try {
     bot = mineflayer.createBot({
-      host: config.host,
-      port: config.port,
-      version: config.version,
-      username: config.username,
-      auth: config.auth,
-      hideErrors: false,
+      host:     CFG.host,
+      port:     CFG.port,
+      version:  CFG.version,
+      username: CFG.username,
+      auth:     CFG.auth,
     });
-  } catch (error) {
-    log.error('mineflayer.createBot failed synchronously:', error.message);
+  } catch (err) {
+    LOG.error('mineflayer.createBot() threw synchronously:', err.message);
     bot = null;
-    transition(State.IDLE, 'createBot error');
-    scheduleReconnect('createBot-error');
+    transition(State.IDLE, 'create-threw');
+    scheduleReconnect('create-error');
     return;
   }
 
+  // ── Spawn timeout ─────────────────────────────────────────────
+  //
+  // Root cause of "INJECTION OK / never spawns":
+  //   Aternos's proxy opens the port and accepts the TCP connection as soon as
+  //   the Java process starts, but PaperMC still needs to load world chunks.
+  //   The login handshake succeeds (inject_allowed + login fire) but Paper
+  //   does not send the spawn packet until the world is ready — which can
+  //   take 30–90 s on a cold Aternos start.
+  //
   spawnTimer = setTimeout(() => {
-    log.warn('Spawn timeout after ' + formatDelay(config.spawnTimeout));
-    finishConnectionCycle(doneRef, 'spawn-timeout');
-  }, config.spawnTimeout);
+    if (done) return;
+    LOG.bot(`⏰ Spawn timeout (${CFG.spawnTimeout / 1000}s) — Paper may still be loading`);
+    done = true;
+    cleanupBot();
+    if (state !== State.WAITING) {
+      transition(State.IDLE, 'spawn-timeout');
+      scheduleReconnect('spawn-timeout');
+    }
+  }, CFG.spawnTimeout);
 
+  // ── inject_allowed ────────────────────────────────────────────
+  // TCP connection established + Minecraft handshake OK.
+  // Does NOT guarantee login or spawn will follow.
   bot.on('inject_allowed', () => {
-    log.net('Handshake accepted by Mineflayer');
+    LOG.net('→ inject_allowed: TCP + handshake OK');
   });
 
+  // ── login ─────────────────────────────────────────────────────
+  // Server accepted the account credentials.
   bot.on('login', () => {
-    log.bot('Login accepted by server');
+    LOG.bot('→ login: account accepted by server');
   });
 
+  // ── spawn ─────────────────────────────────────────────────────
+  // The player entity now exists in the world. The bot is fully online.
   bot.once('spawn', () => {
-    if (doneRef.done) return;
-    clearLifecycleTimers();
+    if (done) return;
 
-    const position = bot && bot.entity && bot.entity.position;
-    const location = position
-      ? Math.round(position.x) + ', ' + Math.round(position.y) + ', ' + Math.round(position.z)
-      : 'unknown';
+    clearTimeout(spawnTimer);
+    spawnTimer = null;
 
+    const p = bot?.entity?.position;
+    const posStr = p
+      ? `(${Math.round(p.x)}, ${Math.round(p.y)}, ${Math.round(p.z)})`
+      : '(unknown)';
+
+    LOG.bot(`✅ Spawned as "${bot?.username ?? '?'}" at ${posStr}`);
     transition(State.CONNECTED, 'spawn');
-    resetCircuitBreaker();
-    log.bot('Spawned as ' + ((bot && bot.username) || config.username) + ' at ' + location);
+    onConnectSuccess();
 
-    if (config.antiAfkEnabled) startAntiAfk();
+    if (CFG.antiAfkEnabled) startAntiAfk();
   });
 
+  // ── kicked ────────────────────────────────────────────────────
+  // Log kick reason. The 'end' event always fires immediately after.
   bot.on('kicked', (reason) => {
-    log.warn('Kicked by server: ' + stringifyReason(reason));
+    let text = reason;
+    try { if (typeof reason !== 'string') text = JSON.stringify(reason); }
+    catch (_) {}
+    LOG.bot(`👢 Kicked: ${text}`);
   });
 
-  bot.on('error', (error) => {
-    const code = (error && error.code) || 'UNKNOWN';
-    log.net('Network error ' + code + ': ' + ((error && error.message) || error));
-    logNetworkHint(code);
+  // ── error ─────────────────────────────────────────────────────
+  // Network-level errors. The 'end' event always fires after 'error'.
+  // We log and diagnose here; reconnect logic lives entirely in 'end'.
+  bot.on('error', (err) => {
+    const code = err.code ?? 'UNKNOWN';
+    LOG.net(`Network error [${code}]: ${err.message}`);
+
+    const notes = {
+      ETIMEDOUT:
+        '  → TCP timeout: server port unreachable ' +
+        '(Aternos not ready, overloaded, or wrong port)',
+      ECONNRESET:
+        '  → Connection reset by remote: Paper closed the socket ' +
+        '(restart, crash, or network hiccup)',
+      ECONNREFUSED:
+        '  → Connection refused: port closed (server is fully offline)',
+      ENOTFOUND:
+        '  → DNS failure: hostname not resolved (Aternos DNS outage)',
+      EPIPE:
+        '  → Broken pipe: server closed connection during a write',
+    };
+    if (notes[code]) LOG.net(notes[code]);
   });
 
+  // ── end ───────────────────────────────────────────────────────
+  // Fired for every disconnection, after 'error', 'kicked', or a clean logout.
+  // This is the SINGLE point of reconnect scheduling — never schedule elsewhere.
   bot.on('end', (reason) => {
-    const text = stringifyReason(reason || 'connection-ended');
-    log.bot('Disconnected: ' + text);
-    finishConnectionCycle(doneRef, 'end:' + text);
+    if (done) return;
+    done = true;
+
+    LOG.bot(`🔌 Disconnected: "${reason ?? 'no reason given'}"`);
+    cleanupBot();
+
+    if (state !== State.WAITING) {
+      transition(State.IDLE, `end:${reason ?? 'unknown'}`);
+      scheduleReconnect(reason ?? 'end');
+    }
   });
 }
 
-function stringifyReason(reason) {
-  if (typeof reason === 'string') return reason;
-  try {
-    return JSON.stringify(reason);
-  } catch (_error) {
-    return String(reason);
-  }
-}
+// ══════════════════════════════════════════════════════════════
+// §6 — ANTI-AFK
+// ══════════════════════════════════════════════════════════════
+//
+// Movements are intentionally simple — no pathfinding, no physics engine.
+// Named functions so action.name appears in logs for easy debugging.
 
-function logNetworkHint(code) {
-  const hints = {
-    ETIMEDOUT: 'TCP timeout: Aternos port is not reachable yet, or the server is overloaded.',
-    ECONNRESET: 'Remote reset: Paper, Aternos, or the network closed the socket abruptly.',
-    ECONNREFUSED: 'Connection refused: TCP port is closed, usually because the server is offline.',
-    ENOTFOUND: 'DNS failure: the Aternos hostname could not be resolved.',
-    EPIPE: 'Broken pipe: the socket closed while Mineflayer was writing.',
-  };
-  if (hints[code]) log.net(hints[code]);
-}
-
-const antiAfkActions = [
-  function jump() {
-    if (!bot) return;
-    bot.setControlState('jump', true);
-    setTimeout(() => { if (bot) bot.setControlState('jump', false); }, 500);
-  },
-  function forward() {
-    if (!bot) return;
-    bot.setControlState('forward', true);
-    setTimeout(() => { if (bot) bot.setControlState('forward', false); }, 800);
-  },
-  function back() {
-    if (!bot) return;
-    bot.setControlState('back', true);
-    setTimeout(() => { if (bot) bot.setControlState('back', false); }, 800);
-  },
-  function strafeLeft() {
-    if (!bot) return;
-    bot.setControlState('left', true);
-    setTimeout(() => { if (bot) bot.setControlState('left', false); }, 800);
-  },
-  function strafeRight() {
-    if (!bot) return;
-    bot.setControlState('right', true);
-    setTimeout(() => { if (bot) bot.setControlState('right', false); }, 800);
-  },
-  function lookAround() {
-    if (!bot || !bot.entity) return;
-    bot.look(bot.entity.yaw + 0.75, bot.entity.pitch, true);
-  },
+const AFK_ACTIONS = [
+  function jump()      { bot?.setControlState('jump',    true);  setTimeout(() => bot?.setControlState('jump',    false), 500); },
+  function forward()   { bot?.setControlState('forward', true);  setTimeout(() => bot?.setControlState('forward', false), 800); },
+  function back()      { bot?.setControlState('back',    true);  setTimeout(() => bot?.setControlState('back',    false), 800); },
+  function strafeLeft(){ bot?.setControlState('left',    true);  setTimeout(() => bot?.setControlState('left',    false), 800); },
+  function strafeRight(){ bot?.setControlState('right',  true);  setTimeout(() => bot?.setControlState('right',   false), 800); },
+  function look()      { if (bot?.entity) bot.look(bot.entity.yaw + 0.75, 0, true); },
 ];
 
 function startAntiAfk() {
@@ -359,98 +410,109 @@ function startAntiAfk() {
   afkCycle = 0;
 
   afkInterval = setInterval(() => {
-    if (state !== State.CONNECTED || !bot) return;
-    const action = antiAfkActions[afkCycle % antiAfkActions.length];
+    if (!bot || state !== State.CONNECTED) return;
     try {
+      const action = AFK_ACTIONS[afkCycle % AFK_ACTIONS.length];
       action();
-      afkCycle += 1;
-      log.bot('Anti-AFK action: ' + action.name + '; cycle=' + afkCycle);
-    } catch (error) {
-      log.warn('Anti-AFK action failed: ' + error.message);
+      LOG.bot(`Anti-AFK → ${action.name}  (cycle ${afkCycle + 1})`);
+      afkCycle++;
+    } catch (err) {
+      LOG.warn(`Anti-AFK error: ${err.message}`);
     }
-  }, config.antiAfkDelay);
+  }, CFG.antiAfkDelay);
 
-  log.bot('Anti-AFK started; interval=' + formatDelay(config.antiAfkDelay));
+  LOG.bot(`🎮 Anti-AFK started  (every ${CFG.antiAfkDelay / 1000}s)`);
 }
+
+// ══════════════════════════════════════════════════════════════
+// §7 — EXPRESS HEALTH SERVER
+// ══════════════════════════════════════════════════════════════
+//
+// Required by Render: a bound HTTP port signals that the service is alive.
+// Without it, Render considers the process dead and kills it.
+// Also useful for external monitoring (e.g. UptimeRobot).
 
 function startHealthServer() {
-  const app = express();
-  const port = Number(process.env.PORT || 3000);
+  const app  = express();
+  const PORT = process.env.PORT || 3000;
 
-  app.get('/health', (_request, response) => {
-    response.status(200).json({
-      ok: true,
-      state,
-      uptimeSeconds: Math.floor(process.uptime()),
-    });
-  });
-
-  app.get('/', (_request, response) => {
-    const memory = process.memoryUsage();
-    response.status(200).json({
-      service: 'minecraft-afk-bot',
-      ok: true,
-      state,
-      uptimeSeconds: Math.floor(process.uptime()),
-      startedAt: new Date(startedAt).toISOString(),
-      lastDisconnectReason,
+  // Full status — useful while debugging
+  app.get('/', (_req, res) => {
+    const mem = process.memoryUsage();
+    res.json({
+      status:  'running',
+      time:    new Date().toISOString(),
+      uptime:  `${Math.floor(process.uptime())}s`,
       bot: {
-        username: bot ? bot.username : null,
-        antiAfkEnabled: config.antiAfkEnabled,
+        state,
+        username:  bot?.username ?? null,
+        tripped:   CB.tripped,
+        attempts:  CB.attempts,
       },
-      minecraft: {
-        host: config.host,
-        port: config.port,
-        version: config.version,
-      },
-      reconnect: {
-        attempts: circuitBreaker.attempts,
-        consecutiveFailures: circuitBreaker.consecutiveFailures,
-        tripped: circuitBreaker.tripped,
-      },
+      server: { host: CFG.host, port: CFG.port, version: CFG.version },
       memory: {
-        rssMb: Number((memory.rss / 1024 / 1024).toFixed(1)),
-        heapUsedMb: Number((memory.heapUsed / 1024 / 1024).toFixed(1)),
+        rss:      `${(mem.rss       / 1024 / 1024).toFixed(1)} MB`,
+        heapUsed: `${(mem.heapUsed  / 1024 / 1024).toFixed(1)} MB`,
       },
     });
   });
 
-  app.listen(port, () => {
-    log.info('Health server listening on port ' + port);
-  });
+  // Minimal health-check endpoint — Render and UptimeRobot hit this
+  app.get('/health', (_req, res) => res.status(200).send('OK'));
+
+  app.listen(PORT, () => LOG.info(`🌐 Health server on port ${PORT}`));
 }
 
-function shutdown(signal) {
-  log.info(signal + ' received; shutting down');
-  transition(State.STOPPING, signal);
-  if (reconnectTimer) {
-    clearTimeout(reconnectTimer);
-    reconnectTimer = null;
-  }
-  cleanupBot();
-  process.exit(0);
-}
+// ══════════════════════════════════════════════════════════════
+// §8 — PROCESS GUARDS
+// ══════════════════════════════════════════════════════════════
 
-process.on('uncaughtException', (error) => {
-  log.error('Uncaught exception:', error.message);
-  log.error(error.stack);
+// Catch unhandled errors without crashing the process.
+// If process.exit() were called here, Render would trigger a redeploy,
+// which resets the startup timer and disconnects the bot.
+process.on('uncaughtException', (err) => {
+  LOG.error('Uncaught exception:', err.message);
+  LOG.error(err.stack);
+  // Do NOT exit — let the bot recover naturally via its reconnect logic.
 });
 
 process.on('unhandledRejection', (reason) => {
-  log.error('Unhandled rejection:', reason);
+  LOG.error('Unhandled rejection:', reason);
 });
 
-process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('SIGINT', () => shutdown('SIGINT'));
+// Render sends SIGTERM before gracefully restarting the service.
+// We have a few seconds to clean up before the process is killed.
+process.on('SIGTERM', () => {
+  LOG.info('SIGTERM received — shutting down gracefully');
+  cleanupBot();
+  clearTimeout(CB.timer);
+  process.exit(0);
+});
 
-log.info('Minecraft AFK Bot v2.0 starting');
-log.info('Target: ' + config.host + ':' + config.port + '; version=' + config.version + '; username=' + config.username);
-log.info('Startup delay: ' + formatDelay(config.startupDelay) + '; spawn timeout: ' + formatDelay(config.spawnTimeout));
+process.on('SIGINT', () => {
+  LOG.info('SIGINT received — shutting down gracefully');
+  cleanupBot();
+  clearTimeout(CB.timer);
+  process.exit(0);
+});
+
+// ══════════════════════════════════════════════════════════════
+// §9 — STARTUP SEQUENCE
+// ══════════════════════════════════════════════════════════════
+
+LOG.info('══════════════════════════════════════════════');
+LOG.info('  Minecraft AFK Bot  ·  v2.0');
+LOG.info(`  ${CFG.host}:${CFG.port}  [Minecraft ${CFG.version}]`);
+LOG.info(`  Username : ${CFG.username}  |  Auth: ${CFG.auth}`);
+LOG.info(`  Anti-AFK : ${CFG.antiAfkEnabled ? `every ${CFG.antiAfkDelay / 1000}s` : 'disabled'}`);
+LOG.info('══════════════════════════════════════════════');
 
 startHealthServer();
 
+LOG.info(`⏳ Waiting ${CFG.startupDelay / 1000}s for Aternos to fully initialize…`);
+LOG.info('   (Aternos shows "online" before PaperMC has loaded chunks — this delay prevents spawn-timeout loops)');
+
 setTimeout(() => {
-  if (state !== State.IDLE) return;
-  log.info('Startup delay complete; starting Minecraft connection');
+  LOG.info('🚀 Startup delay complete — launching bot');
   createBot();
-}, config.startupDelay);
+}, CFG.startupDelay);
